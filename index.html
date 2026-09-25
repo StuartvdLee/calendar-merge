@@ -255,6 +255,190 @@
     });
   }
 
+  // Parses "NAME;PARAM=value;PARAM2="quoted value":VALUE" into its parts.
+  function parseLine(line) {
+    const idx = line.indexOf(':');
+    const head = idx === -1 ? line : line.slice(0, idx);
+    const value = idx === -1 ? '' : line.slice(idx + 1);
+    const segments = head.split(';');
+    const name = segments[0].trim().toUpperCase();
+    const params = {};
+    for (let i = 1; i < segments.length; i++) {
+      const eq = segments[i].indexOf('=');
+      if (eq === -1) continue;
+      const pname = segments[i].slice(0, eq).trim().toUpperCase();
+      let pval = segments[i].slice(eq + 1).trim();
+      if (pval.startsWith('"') && pval.endsWith('"')) pval = pval.slice(1, -1);
+      params[pname] = pval;
+    }
+    return { name, params, value };
+  }
+
+  function findParsedLine(component, wanted) {
+    for (const line of component.lines) {
+      const parsed = parseLine(line);
+      if (parsed.name === wanted) return parsed;
+    }
+    return null;
+  }
+
+  const WEEKDAYS = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+
+  // Returns the day-of-month (UTC calendar) for the nth weekday rule used by
+  // VTIMEZONE RRULEs, e.g. n=-1, weekday=0 ("-1SU") means "last Sunday".
+  function nthWeekdayOfMonth(year, month, n, weekday) {
+    if (n > 0) {
+      const firstDow = new Date(Date.UTC(year, month - 1, 1)).getUTCDay();
+      const firstOccurrence = 1 + ((weekday - firstDow + 7) % 7);
+      return firstOccurrence + (n - 1) * 7;
+    }
+    const lastDate = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    const lastDow = new Date(Date.UTC(year, month - 1, lastDate)).getUTCDay();
+    const lastOccurrence = lastDate - ((lastDow - weekday + 7) % 7);
+    return lastOccurrence + (n + 1) * 7;
+  }
+
+  function parseIcsDateTime(value) {
+    const m = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/);
+    if (!m) return null;
+    return {
+      year: +m[1], month: +m[2], day: +m[3],
+      hour: +m[4], minute: +m[5], second: +m[6]
+    };
+  }
+
+  function parseOffset(str) {
+    const m = str.match(/^([+-])(\d{2})(\d{2})/);
+    if (!m) return 0;
+    const sign = m[1] === '-' ? -1 : 1;
+    return sign * (parseInt(m[2], 10) * 60 + parseInt(m[3], 10));
+  }
+
+  // Extracts the STANDARD/DAYLIGHT sub-block of a VTIMEZONE component.
+  function getTzSubRule(tzComponent, kind) {
+    const lines = tzComponent.lines;
+    let inBlock = false;
+    let dtstart = null, rrule = null, offsetFrom = null, offsetTo = null;
+    for (const raw of lines) {
+      const parsed = parseLine(raw);
+      if (parsed.name === 'BEGIN' && parsed.value.trim().toUpperCase() === kind) {
+        inBlock = true;
+        dtstart = null; rrule = null; offsetFrom = null; offsetTo = null;
+        continue;
+      }
+      if (parsed.name === 'END' && parsed.value.trim().toUpperCase() === kind) {
+        if (dtstart && offsetTo !== null) return { dtstart, rrule, offsetFrom, offsetTo };
+        inBlock = false;
+        continue;
+      }
+      if (!inBlock) continue;
+      if (parsed.name === 'DTSTART') dtstart = parseIcsDateTime(parsed.value);
+      else if (parsed.name === 'TZOFFSETFROM') offsetFrom = parseOffset(parsed.value);
+      else if (parsed.name === 'TZOFFSETTO') offsetTo = parseOffset(parsed.value);
+      else if (parsed.name === 'RRULE') {
+        rrule = {};
+        for (const part of parsed.value.split(';')) {
+          const eq = part.indexOf('=');
+          if (eq === -1) continue;
+          rrule[part.slice(0, eq).toUpperCase()] = part.slice(eq + 1);
+        }
+      }
+    }
+    return null;
+  }
+
+  // Millis (UTC) at which this STANDARD/DAYLIGHT rule takes effect in the given year.
+  function transitionUtcMillis(rule, year) {
+    let month, day;
+    if (rule.rrule && rule.rrule.BYMONTH && rule.rrule.BYDAY) {
+      month = parseInt(rule.rrule.BYMONTH, 10);
+      const dm = rule.rrule.BYDAY.match(/^(-?\d+)([A-Z]{2})$/);
+      if (!dm || !(dm[2] in WEEKDAYS)) return null;
+      day = nthWeekdayOfMonth(year, month, parseInt(dm[1], 10), WEEKDAYS[dm[2]]);
+    } else if (rule.dtstart) {
+      if (rule.dtstart.year !== year) return null;
+      month = rule.dtstart.month;
+      day = rule.dtstart.day;
+    } else {
+      return null;
+    }
+    const hour = rule.rrule && rule.rrule.BYHOUR !== undefined ? parseInt(rule.rrule.BYHOUR, 10) : rule.dtstart.hour;
+    const minute = rule.rrule && rule.rrule.BYMINUTE !== undefined ? parseInt(rule.rrule.BYMINUTE, 10) : rule.dtstart.minute;
+    const second = rule.rrule && rule.rrule.BYSECOND !== undefined ? parseInt(rule.rrule.BYSECOND, 10) : rule.dtstart.second;
+    return Date.UTC(year, month - 1, day, hour, minute, second) - rule.offsetFrom * 60000;
+  }
+
+  // Converts a floating local date-time to UTC millis using a VTIMEZONE definition.
+  function localToUtcMillis(dt, tzComponent) {
+    const std = getTzSubRule(tzComponent, 'STANDARD');
+    const dst = getTzSubRule(tzComponent, 'DAYLIGHT');
+    if (!std && !dst) return null;
+    if (std && !dst) return Date.UTC(dt.year, dt.month - 1, dt.day, dt.hour, dt.minute, dt.second) - std.offsetTo * 60000;
+    if (dst && !std) return Date.UTC(dt.year, dt.month - 1, dt.day, dt.hour, dt.minute, dt.second) - dst.offsetTo * 60000;
+
+    const localMillis = Date.UTC(dt.year, dt.month - 1, dt.day, dt.hour, dt.minute, dt.second);
+    // First guess using STANDARD offset, then find the transitions bracketing
+    // that instant across the surrounding years to pick the correct offset.
+    let candidate = localMillis - std.offsetTo * 60000;
+    for (let pass = 0; pass < 2; pass++) {
+      const transitions = [];
+      for (const year of [dt.year - 1, dt.year, dt.year + 1]) {
+        const dstT = transitionUtcMillis(dst, year);
+        const stdT = transitionUtcMillis(std, year);
+        if (dstT !== null) transitions.push({ time: dstT, offset: dst.offsetTo });
+        if (stdT !== null) transitions.push({ time: stdT, offset: std.offsetTo });
+      }
+      transitions.sort((a, b) => a.time - b.time);
+      let active = std.offsetTo;
+      for (const t of transitions) {
+        if (t.time <= candidate) active = t.offset;
+        else break;
+      }
+      const next = localMillis - active * 60000;
+      if (next === candidate) break;
+      candidate = next;
+    }
+    return candidate;
+  }
+
+  function formatUtcIcsDateTime(millis) {
+    const d = new Date(millis);
+    const pad = (n, len = 2) => String(n).padStart(len, '0');
+    return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+  }
+
+  // Fixes RRULE:UNTIL values that are missing the RFC 5545-required UTC "Z"
+  // suffix (common in Outlook/Exchange exports), which otherwise causes
+  // importers to silently stop generating instances past that point.
+  function normalizeRruleUntil(component, timezones) {
+    const rruleParsed = findParsedLine(component, 'RRULE');
+    if (!rruleParsed) return;
+    const untilMatch = rruleParsed.value.match(/UNTIL=([^;]+)/);
+    if (!untilMatch) return;
+    const until = untilMatch[1];
+    if (/Z$/.test(until)) return;
+
+    const dtstartParsed = findParsedLine(component, 'DTSTART');
+    if (!dtstartParsed) return;
+    const dt = parseIcsDateTime(until);
+    if (!dt) return;
+
+    let utcMillis;
+    if (dtstartParsed.params.TZID && timezones.has(dtstartParsed.params.TZID)) {
+      utcMillis = localToUtcMillis(dt, timezones.get(dtstartParsed.params.TZID));
+    } else if (!dtstartParsed.params.TZID && !/Z$/.test(dtstartParsed.value)) {
+      // Floating local time with no timezone info available: treat as UTC.
+      utcMillis = Date.UTC(dt.year, dt.month - 1, dt.day, dt.hour, dt.minute, dt.second);
+    }
+    if (utcMillis === null || utcMillis === undefined || Number.isNaN(utcMillis)) return;
+
+    const fixedUntil = formatUtcIcsDateTime(utcMillis);
+    const newRruleValue = rruleParsed.value.replace(/UNTIL=[^;]+/, `UNTIL=${fixedUntil}`);
+    component.lines = component.lines.map(line =>
+      propName(line) === 'RRULE' ? line.slice(0, line.indexOf(':') + 1) + newRruleValue : line
+    );
+  }
+
   const nextFrame = () => new Promise(r => requestAnimationFrame(() => r()));
 
   function setProgress(pct, message, state) {
@@ -329,6 +513,7 @@
     let eventCount = 0;
     let duplicates = 0;
     let renamed = 0;
+    let untilFixed = 0;
 
     try {
       for (let i = 0; i < files.length; i++) {
@@ -343,12 +528,22 @@
 
         const components = parseCalendar(unfold(text));
 
+        // Register this file's timezones first so RRULE:UNTIL fixes below
+        // can resolve a TZID even if VEVENTs precede VTIMEZONE in the file.
         for (const component of components) {
-          if (component.type === 'VTIMEZONE') {
-            const tzid = findProp(component, 'TZID');
-            if (tzid && !timezones.has(tzid)) timezones.set(tzid, component);
-            continue;
-          }
+          if (component.type !== 'VTIMEZONE') continue;
+          const tzid = findProp(component, 'TZID');
+          if (tzid && !timezones.has(tzid)) timezones.set(tzid, component);
+        }
+
+        for (const component of components) {
+          if (component.type === 'VTIMEZONE') continue;
+
+          const untilBefore = findParsedLine(component, 'RRULE');
+          const hadBareUntil = untilBefore && /UNTIL=[^;Z]+(;|$)/.test(untilBefore.value);
+          if (hadBareUntil) normalizeRruleUntil(component, timezones);
+          const untilAfter = findParsedLine(component, 'RRULE');
+          if (hadBareUntil && untilAfter && /UNTIL=[^;]+Z/.test(untilAfter.value)) untilFixed++;
 
           const uid = findProp(component, 'UID');
           const recurrenceId = findProp(component, 'RECURRENCE-ID');
@@ -410,6 +605,7 @@
       if (timezones.size) notes.push(`${timezones.size} timezone(s)`);
       if (duplicates) notes.push(`${duplicates} duplicate(s) removed`);
       if (renamed) notes.push(`${renamed} UID conflict(s) renamed`);
+      if (untilFixed) notes.push(`${untilFixed} recurring UNTIL date(s) fixed`);
       setProgress(100, 'Done — ' + notes.join(', ') + '.', 'done');
     } catch (err) {
       setProgress(100, 'Merge failed: ' + err.message, 'error');
